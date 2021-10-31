@@ -5,21 +5,29 @@ import {
   interval,
   fromEvent,
   merge,
+  Subject,
+  BehaviorSubject,
 } from "rxjs";
 import {
+  exhaustMap,
+  mergeMap,
+  concatMap,
+  switchMap,
   distinctUntilChanged,
   scan,
   sample,
   startWith,
   mapTo,
   filter,
+  skip,
   map,
+  take,
 } from "rxjs/operators";
 
 const keyDown$ = fromEvent(document, "keydown");
 const keyUp$ = fromEvent(document, "keyup");
 
-const [x0, y0] = [0, 200];
+const [x0, y0] = [0, 610];
 
 const leftState = merge(
   keyDown$.pipe(
@@ -46,13 +54,13 @@ const rightState = merge(
 const upState = merge(
   keyDown$.pipe(
     filter(({ key }) => key === "ArrowUp"),
-    mapTo({ playerMove: [0, -2] })
+    mapTo({ playerMove: [0, -2], moving: true })
   ),
   keyUp$.pipe(
     filter(({ key }) => key === "ArrowUp"),
-    mapTo({ playerMove: [0, 0] })
+    mapTo({ playerMove: [0, 0], moving: false })
   )
-).pipe(startWith({ playerMove: [0, 0] }));
+).pipe(startWith({ playerMove: [0, 0], moving: false }));
 
 const downState = merge(
   keyDown$.pipe(
@@ -65,16 +73,33 @@ const downState = merge(
   )
 ).pipe(startWith({ playerMove: [0, 0] }));
 
-const moves = combineLatest(leftState, rightState, upState, downState).pipe(
-  map((all) => all.map(({ playerMove }) => playerMove)),
-  map((moves) =>
-    moves.reduce((acc, move) => [acc[0] + move[0], acc[1] + move[1]], [0, 0])
-  )
+const jumpSteps = [2, 8, 14, 20, 22, 24, 28, 24, 22, 20, 14, 8, 2, 0].map(
+  (x) => y0 - x * 1.5
 );
 
+const jump$ = () =>
+  interval(16 * 3).pipe(
+    take(jumpSteps.length),
+    map((i) => jumpSteps[i])
+  );
+
+const jumping$ = upState.pipe(
+  map(({ moving }) => moving),
+  distinctUntilChanged(),
+  filter((x) => x),
+  exhaustMap(jump$)
+);
+
+const reduceMoves = (moves) => moves.reduce((acc, move) => acc + move[0], 0);
+
+const horizontalMoves = combineLatest(
+  leftState.pipe(map(({ playerMove }) => playerMove)),
+  rightState.pipe(map(({ playerMove }) => playerMove))
+).pipe(map(reduceMoves));
+
 const sampledMoves = interval(16).pipe(
-  withLatestFrom(moves),
-  map(([_, move]) => move)
+  withLatestFrom(horizontalMoves),
+  map(([_, move]) => parseInt(move))
 );
 
 const sampledMoveLeft = interval(16).pipe(
@@ -134,13 +159,87 @@ sampledImage.subscribe((className) => {
   window.player.className = className;
 });
 
-const position = sampledMoves
-  .pipe(
-    map(([x, y]) => [parseInt(x), parseInt(y)]),
-    startWith([0, 0]),
-    scan(([x0, y0], [x, y]) => [x0 + x, y0 + y])
-  )
-  .subscribe(([x, y]) => {
-    window.player.style.left = x + "px";
-    window.player.style.top = y + "px";
-  });
+const moveHorizontally = (x0, [x, v]) => {
+  const newPos = x0 + x * v;
+
+  return newPos;
+};
+
+const velocitySub$ = new BehaviorSubject(1);
+
+const horizontalPosition$ = sampledMoves.pipe(
+  startWith(x0),
+  withLatestFrom(velocitySub$),
+  scan(moveHorizontally, 0)
+);
+
+const groundObstacle$ = horizontalPosition$.pipe(
+  map((x) => (x >= 274 && x <= 326 ? 26 : 0))
+);
+
+horizontalPosition$.subscribe((x) => {
+  window.player.style.left = x + "px";
+});
+
+const jumpingWithObstacle$ = jumping$.pipe(
+  withLatestFrom(groundObstacle$),
+  map(([jump, obstacle]) => {
+    const localJump = Math.abs(jump - y0);
+    if (localJump < obstacle) {
+      return [true, y0 - obstacle];
+    }
+
+    return [false, jump];
+  })
+);
+
+const goDownSteps = [26, 24, 22, 20, 14, 8, 2, 0].map((x) => y0 - x);
+
+const down$ = () =>
+  interval(16 * 3).pipe(
+    take(goDownSteps.length),
+    map((i) => goDownSteps[i])
+  );
+
+const falling$ = groundObstacle$.pipe(
+  distinctUntilChanged(),
+  filter((x) => x === 0)
+);
+
+const standingOnObstacle$ = jumpingWithObstacle$.pipe(
+  map(([x]) => x),
+  distinctUntilChanged(),
+  filter((x) => x)
+);
+
+const fallFromObstacle$ = standingOnObstacle$.pipe(
+  sample(falling$),
+  exhaustMap(down$)
+);
+
+const positionY$ = merge(
+  jumpingWithObstacle$.pipe(
+    map(([_, x]) => x),
+    startWith(y0)
+  ),
+  fallFromObstacle$
+);
+
+const jumpVelocity$ = positionY$.pipe(
+  filter((pos) => pos >= 26),
+  mapTo(1.5)
+);
+
+const walkVelocity$ = groundObstacle$.pipe(
+  map((obs) => !!obs),
+  map((obs) => (obs ? 0 : 1)),
+  distinctUntilChanged()
+);
+
+merge(jumpVelocity$, walkVelocity$).subscribe((v) => {
+  velocitySub$.next(v);
+});
+
+positionY$.subscribe((y) => {
+  window.player.style.top = y + "px";
+});
